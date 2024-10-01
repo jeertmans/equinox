@@ -1,3 +1,4 @@
+import atexit
 import functools as ft
 import inspect
 import logging
@@ -7,8 +8,11 @@ from typing import Any, Literal, overload, TypeVar
 from typing_extensions import ParamSpec
 
 import jax
+import jax._src.dispatch
 import jax._src.traceback_util as traceback_util
 import jax.core
+import jax.errors
+import jax.numpy as jnp
 from jaxtyping import PyTree
 
 from ._compile_utils import (
@@ -50,7 +54,8 @@ def _filter_jit_cache(fun_names, jitkwargs):
         assert dummy_arg is None
         out = fun(*args, **kwargs)
         dynamic_out, static_out = partition(out, is_array)
-        return dynamic_out, Static(static_out)
+        marker = jnp.array(0)
+        return marker, dynamic_out, Static(static_out)
 
     fun_name, fun_qualname = fun_names
     fun_wrapped.__name__ = fun_name
@@ -99,17 +104,41 @@ def _preprocess(info, args, kwargs, return_static: bool = False):
 
 
 def _postprocess(out):
-    dynamic_out, static_out = out
+    _, dynamic_out, static_out = out
     return combine(dynamic_out, static_out.value)
 
 
 try:
-    # Not public API, so wrap in a try-except for forward compatibility.
-    XlaRuntimeError = jax.lib.xla_extension.XlaRuntimeError  # pyright: ignore
-except Exception:
-    # Unused dummy
-    class XlaRuntimeError(Exception):
-        pass
+    # Added in JAX 0.4.34.
+    JaxRuntimeError = jax.errors.JaxRuntimeError  # pyright: ignore[reportAttributeAccessIssue]
+except AttributeError:
+    try:
+        # Forward compatibility in case they ever decide to fix the capitalization.
+        JaxRuntimeError = jax.errors.JAXRuntimeError  # pyright: ignore[reportAttributeAccessIssue]
+    except AttributeError:
+        # Not public API, so wrap in a try-except for forward compatibility.
+        try:
+            JaxRuntimeError = jax.lib.xla_extension.XlaRuntimeError  # pyright: ignore
+        except Exception:
+            # Unused dummy
+            class JaxRuntimeError(Exception):
+                pass
+
+
+try:
+    wait_for_tokens = jax._src.dispatch.wait_for_tokens
+except AttributeError:
+    pass  # forward compatibility
+else:
+    # Fix for https://github.com/patrick-kidger/diffrax/issues/506
+    def wait_for_tokens2():
+        try:
+            wait_for_tokens()
+        except JaxRuntimeError:
+            pass
+
+    atexit.unregister(wait_for_tokens)
+    atexit.register(wait_for_tokens2)
 
 
 # This is the class we use to raise runtime errors from `eqx.error_if`.
@@ -178,7 +207,8 @@ class _JitWrapper(Module):
     def _call(self, is_lower, args, kwargs):
         __tracebackhide__ = True
         # Used by our error messages when figuring out where to stop walking the stack.
-        if not currently_jitting():
+        jitting = currently_jitting()
+        if not jitting:
             __equinox_filter_jit__ = True  # noqa: F841
         info = (
             self._signature,
@@ -207,10 +237,16 @@ class _JitWrapper(Module):
                         warnings.filterwarnings(
                             "ignore", message="Some donated buffers were not usable*"
                         )
-                        out = self._cached(dynamic_donate, dynamic_nodonate, static)
+                        marker, _, _ = out = self._cached(
+                            dynamic_donate, dynamic_nodonate, static
+                        )
                 else:
-                    out = self._cached(dynamic_donate, dynamic_nodonate, static)
-            except XlaRuntimeError as e:
+                    marker, _, _ = out = self._cached(
+                        dynamic_donate, dynamic_nodonate, static
+                    )
+                if not jitting:
+                    marker.block_until_ready()
+            except JaxRuntimeError as e:
                 # Catch Equinox's runtime errors, and re-raise them with actually useful
                 # information. (By default XlaRuntimeError produces a lot of terrifying
                 # but useless information.)
